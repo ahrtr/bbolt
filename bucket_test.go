@@ -21,6 +21,32 @@ import (
 	"go.etcd.io/bbolt/internal/btesting"
 )
 
+func TestRemoveAllKeys(t *testing.T) {
+	// Change this to the real db path
+	dbPath := "/Users/wachao/Downloads/tmp/etcd-data-node-1/member/snap/db"
+	newDBPath := "/Users/wachao/Downloads/tmp/etcd-data-node-1/member/snap/db_new"
+	db, err := bolt.Open(dbPath, 0600, &bolt.Options{})
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("key"))
+		c := b.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			require.NoError(t, c.Delete())
+		}
+		return nil
+	})
+
+	// open the new database
+	dst, err := bolt.Open(newDBPath, 0600, &bolt.Options{NoSync: true})
+	require.NoError(t, err)
+	defer dst.Close()
+
+	err = bolt.Compact(dst, db, 65536)
+	require.NoError(t, err)
+}
+
 // Ensure that a bucket that gets a non-existent key returns nil.
 func TestBucket_Get_NonExistent(t *testing.T) {
 	db := btesting.MustCreateDB(t)
