@@ -58,6 +58,12 @@ func (b *Bucket) Tx() *Tx {
 	return b.tx
 }
 
+// String returns a human-readable representation of the bucket, identifying
+// it by its root page id.
+func (b *Bucket) String() string {
+	return fmt.Sprintf("Bucket<pgid=%d>", b.RootPage())
+}
+
 // Root returns the root of the bucket.
 func (b *Bucket) Root() common.Pgid {
 	return b.RootPage()
@@ -378,6 +384,16 @@ func (b *Bucket) MoveBucket(key []byte, dstBucket *Bucket) (err error) {
 		return errors.ErrSameBuckets
 	}
 
+	// Return an error if the destination bucket is the bucket being moved
+	// itself or one of its descendants. Allowing this would create a cycle
+	// in the bucket structure, since the moved bucket would end up nested
+	// inside its own subtree.
+	childBucket := b.Bucket(newKey)
+	if childBucket != nil && bucketContainsBucket(childBucket, dstBucket) {
+		lg.Errorf("The target bucket (%s) is the same as or a descendant of the bucket (%s) being moved", dstBucket, childBucket)
+		return errors.ErrCyclicBucketMove
+	}
+
 	// check whether the key already exists in the destination bucket
 	curDst := dstBucket.Cursor()
 	k, _, flags = curDst.seek(newKey)
@@ -400,6 +416,26 @@ func (b *Bucket) MoveBucket(key []byte, dstBucket *Bucket) (err error) {
 	curDst.node().put(newKey, newKey, newValue, 0, common.BucketLeafFlag)
 
 	return nil
+}
+
+// bucketContainsBucket reports whether target is ancestor itself or is
+// nested anywhere within ancestor's subtree of sub-buckets.
+func bucketContainsBucket(ancestor, target *Bucket) bool {
+	if ancestor == target || (ancestor.RootPage() == target.RootPage() && ancestor.RootPage() != 0) {
+		return true
+	}
+
+	found := false
+	_ = ancestor.ForEachBucket(func(k []byte) error {
+		if found {
+			return nil
+		}
+		if child := ancestor.Bucket(k); child != nil && bucketContainsBucket(child, target) {
+			found = true
+		}
+		return nil
+	})
+	return found
 }
 
 // Inspect returns the structure of the bucket.

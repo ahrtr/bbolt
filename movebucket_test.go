@@ -264,13 +264,109 @@ func TestBucket_MoveBucket_DiffDB(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestTx_MoveBucket_Cyclic(t *testing.T) {
+	testCases := []struct {
+		name string
+		// dstBucketPath is relative to the bucket being moved, e.g.
+		// []string{"child"} means dst is a direct child of the bucket
+		// being moved, and []string{"child", "grandchild"} means dst
+		// is a grandchild of the bucket being moved.
+		dstBucketPath []string
+	}{
+		{
+			name:          "moving a bucket into itself",
+			dstBucketPath: []string{},
+		},
+		{
+			name:          "moving a bucket into its own child",
+			dstBucketPath: []string{"child"},
+		},
+		{
+			name:          "moving a bucket into its own grandchild",
+			dstBucketPath: []string{"child", "grandchild"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := btesting.MustCreateDBWithOption(t, &bbolt.Options{PageSize: 4096})
+
+			srcBucketPath := []string{"sb1", "sb2"}
+			bucketToMove := "bucketToMove"
+
+			err := db.Update(func(tx *bbolt.Tx) error {
+				srcBucket := prepareBuckets(t, tx, srcBucketPath...)
+				movedBucket := createBucketAndPopulateData(t, tx, srcBucket, bucketToMove)
+
+				// Build the nested path (dstBucketPath) inside the bucket being moved.
+				nested := movedBucket
+				for _, name := range tc.dstBucketPath {
+					nested = createBucketAndPopulateData(t, tx, nested, name)
+				}
+				return nil
+			})
+			require.NoError(t, err)
+
+			err = db.Update(func(tx *bbolt.Tx) error {
+				srcBucket := prepareBuckets(t, tx, srcBucketPath...)
+				movedBucket := srcBucket.Bucket([]byte(bucketToMove))
+				require.NotNil(t, movedBucket)
+
+				dstBucket := movedBucket
+				for _, name := range tc.dstBucketPath {
+					dstBucket = dstBucket.Bucket([]byte(name))
+					require.NotNil(t, dstBucket)
+				}
+
+				mErr := tx.MoveBucket([]byte(bucketToMove), srcBucket, dstBucket)
+				require.Equal(t, errors.ErrCyclicBucketMove, mErr)
+				return nil
+			})
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestTx_MoveBucket_Cyclic_With_InlineBucket verifies that the cyclic-move
+// check also catches descendants that are inline buckets (RootPage() == 0),
+// not just regular page-backed buckets.
+func TestTx_MoveBucket_Cyclic_With_InlineBucket(t *testing.T) {
+	db := btesting.MustCreateDBWithOption(t, &bbolt.Options{PageSize: 4096})
+	err := db.Update(func(tx *bbolt.Tx) error {
+		b1, berr := tx.CreateBucketIfNotExists([]byte("b1"))
+		if berr != nil {
+			return berr
+		}
+		b2, berr := b1.CreateBucketIfNotExists([]byte("b2"))
+		if berr != nil {
+			return berr
+		}
+		// The b3 is an inline bucket, which means its RootPage is 0.
+		b3, berr := b2.CreateBucketIfNotExists([]byte("b3"))
+		if berr != nil {
+			return berr
+		}
+		return b3.Put([]byte("key"), []byte("value"))
+	})
+	require.NoError(t, err)
+
+	err = db.Update(func(tx *bbolt.Tx) error {
+		b1 := tx.Bucket([]byte("b1"))
+		b2 := b1.Bucket([]byte("b2"))
+		b3 := b2.Bucket([]byte("b3"))
+
+		return tx.MoveBucket([]byte("b2"), b1, b3)
+	})
+	require.Equal(t, errors.ErrCyclicBucketMove, err)
+}
+
 func TestBucket_MoveBucket_DiffTx(t *testing.T) {
 	testCases := []struct {
 		name            string
 		srcBucketPath   []string
 		dstBucketPath   []string
-		isSrcReadonlyTx bool
-		isDstReadonlyTx bool
+		isSrcWritableTx bool
+		isDstWritableTx bool
 		bucketToMove    string
 		expectedErr     error
 	}{
@@ -278,8 +374,8 @@ func TestBucket_MoveBucket_DiffTx(t *testing.T) {
 			name:            "src is RWTx and target is RTx",
 			srcBucketPath:   []string{"sb1", "sb2"},
 			dstBucketPath:   []string{"db1", "db2"},
-			isSrcReadonlyTx: true,
-			isDstReadonlyTx: false,
+			isSrcWritableTx: true,
+			isDstWritableTx: false,
 			bucketToMove:    "bucketToMove",
 			expectedErr:     errors.ErrTxNotWritable,
 		},
@@ -287,8 +383,8 @@ func TestBucket_MoveBucket_DiffTx(t *testing.T) {
 			name:            "src is RTx and target is RWTx",
 			srcBucketPath:   []string{"sb1", "sb2"},
 			dstBucketPath:   []string{"db1", "db2"},
-			isSrcReadonlyTx: false,
-			isDstReadonlyTx: true,
+			isSrcWritableTx: false,
+			isDstWritableTx: true,
 			bucketToMove:    "bucketToMove",
 			expectedErr:     errors.ErrTxNotWritable,
 		},
@@ -312,7 +408,7 @@ func TestBucket_MoveBucket_DiffTx(t *testing.T) {
 			}()
 
 			t.Log("Opening source bucket in a separate Tx")
-			sTx, sErr := db.Begin(tc.isSrcReadonlyTx)
+			sTx, sErr := db.Begin(tc.isSrcWritableTx)
 			require.NoError(t, sErr)
 			defer func() {
 				require.NoError(t, sTx.Rollback())
@@ -320,7 +416,7 @@ func TestBucket_MoveBucket_DiffTx(t *testing.T) {
 			srcBucket = prepareBuckets(t, sTx, tc.srcBucketPath...)
 
 			t.Log("Opening target bucket in a separate Tx")
-			dTx, dErr := db.Begin(tc.isDstReadonlyTx)
+			dTx, dErr := db.Begin(tc.isDstWritableTx)
 			require.NoError(t, dErr)
 			defer func() {
 				require.NoError(t, dTx.Rollback())
@@ -328,13 +424,8 @@ func TestBucket_MoveBucket_DiffTx(t *testing.T) {
 			dstBucket = prepareBuckets(t, dTx, tc.dstBucketPath...)
 
 			t.Log("Moving the sub-bucket")
-			err = db.View(func(tx *bbolt.Tx) error {
-				mErr := srcBucket.MoveBucket([]byte(tc.bucketToMove), dstBucket)
-				require.Equal(t, tc.expectedErr, mErr)
-
-				return nil
-			})
-			require.NoError(t, err)
+			mErr := srcBucket.MoveBucket([]byte(tc.bucketToMove), dstBucket)
+			require.Equal(t, tc.expectedErr, mErr)
 		})
 	}
 }
