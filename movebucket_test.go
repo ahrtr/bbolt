@@ -264,6 +264,82 @@ func TestBucket_MoveBucket_DiffDB(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestBucket_Write_after_MoveBucket(t *testing.T) {
+	db := btesting.MustCreateDBWithOption(t, &bbolt.Options{PageSize: 4096})
+
+	err := db.Update(func(tx *bbolt.Tx) error {
+		b1, err := tx.CreateBucket([]byte("b1"))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucket([]byte("b2"))
+		if err != nil {
+			return err
+		}
+		if _, err = b1.CreateBucket([]byte("childToMove")); err != nil {
+			return err
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	err = db.Update(func(tx *bbolt.Tx) error {
+		b1 := tx.Bucket([]byte("b1"))
+		b2 := tx.Bucket([]byte("b2"))
+		childToMove := b1.Bucket([]byte("childToMove"))
+
+		if err := tx.MoveBucket([]byte("childToMove"), b1, b2); err != nil {
+			return err
+		}
+
+		return childToMove.Put([]byte("foo"), []byte("bar"))
+	})
+	require.NoError(t, err)
+
+	_ = db.View(func(tx *bbolt.Tx) error {
+		b2 := tx.Bucket([]byte("b2"))
+		childToMove := b2.Bucket([]byte("childToMove"))
+		val := childToMove.Get([]byte("foo"))
+		require.Equal(t, []byte("bar"), val)
+		return nil
+	})
+}
+
+func TestTx_MoveBucket_MultipleTimes_Cyclic(t *testing.T) {
+	db := btesting.MustCreateDBWithOption(t, &bbolt.Options{PageSize: 4096})
+
+	err := db.Update(func(tx *bbolt.Tx) error {
+		a, err := tx.CreateBucket([]byte("a"))
+		if err != nil {
+			return err
+		}
+		if _, err = a.CreateBucket([]byte("b")); err != nil {
+			return err
+		}
+		_, err = tx.CreateBucket([]byte("x"))
+		return err
+	})
+	require.NoError(t, err)
+
+	var moveErr error
+	err = db.Update(func(tx *bbolt.Tx) error {
+		a := tx.Bucket([]byte("a"))
+		x := tx.Bucket([]byte("x"))
+		b := a.Bucket([]byte("b"))
+
+		require.NotNil(t, b)
+		require.Zero(t, b.Root())
+		if err := tx.MoveBucket([]byte("b"), a, x); err != nil {
+			return err
+		}
+
+		moveErr = tx.MoveBucket([]byte("x"), nil, b)
+		return nil
+	})
+	require.NoError(t, err)
+	require.ErrorIs(t, moveErr, errors.ErrCyclicBucketMove)
+}
+
 func TestTx_MoveBucket_Cyclic(t *testing.T) {
 	testCases := []struct {
 		name string
@@ -486,4 +562,29 @@ func populateSampleDataInBucket(t testing.TB, bk *bbolt.Bucket, n int) {
 		err = bk.Put(keyData, valData)
 		require.NoError(t, err)
 	}
+}
+
+func TestBucket_MoveBucket_PreservesSequence(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		src, err := tx.CreateBucket([]byte("src"))
+		require.NoError(t, err)
+		dst, err := tx.CreateBucket([]byte("dst"))
+		require.NoError(t, err)
+		child, err := src.CreateBucket([]byte("child"))
+		require.NoError(t, err)
+		require.NoError(t, child.SetSequence(42))
+
+		require.NoError(t, src.MoveBucket([]byte("child"), dst))
+		require.Equal(t, uint64(42), dst.Bucket([]byte("child")).Sequence())
+		return nil
+	}))
+
+	require.NoError(t, db.View(func(tx *bbolt.Tx) error {
+		child := tx.Bucket([]byte("dst")).Bucket([]byte("child"))
+		require.NotNil(t, child)
+		require.Equal(t, uint64(42), child.Sequence())
+		return nil
+	}))
 }
